@@ -434,3 +434,59 @@ client.AppsV1alpha1().Websites("default").Get(ctx, "demo-website", metav1.GetOpt
 ```bash
 make verify
 ```
+
+
+
+## 测试：
+1. apply chapter3/config/crd/bases/apps.clientgo-learning.io_websites.yaml 自定义资源定义
+```bash
+[root@ip-172-31-47-139 clientgo-learn]# kubectl apply -f chapter3/config/crd/bases/apps.clientgo-learning.io_websites.yaml
+customresourcedefinition.apiextensions.k8s.io/websites.apps.clientgo-learning.io created
+```
+
+检查发现 websites.apps.clientgo-learning.io 自定义资源已经成功创建：
+```bash
+[root@ip-172-31-47-139 clientgo-learn]# kubectl get crd | grep -i website
+websites.apps.clientgo-learning.io                                2026-06-06T09:12:00Z
+```
+
+api-resources 中也已经成功创建相关的 apigroup 和 resource：
+```bash
+[root@ip-172-31-47-139 clientgo-learn]# kubectl api-resources | grep -i website
+websites                                     web               apps.clientgo-learning.io/v1alpha1         true         Website
+```
+
+2. 创建 websites 资源，示例模板（chapter3/config/samples/apps_v1alpha1_website.yaml）
+```bash
+[root@ip-172-31-47-139 clientgo-learn]# kubectl apply -f chapter3/config/samples/apps_v1alpha1_website.yaml
+website.apps.clientgo-learning.io/demo-website created
+```
+
+3. 获取 websites 资源信息，可以正常获取到 website 资源
+```bash
+[root@ip-172-31-47-139 clientgo-learn]# kubectl get website demo-website -n default
+NAME           IMAGE        REPLICAS   READY   PHASE
+demo-website   nginx:1.27   2                  
+```
+
+## 总结
+
+本章通过 `Website` 自定义资源完整走了一遍 CRD API 定义和代码生成流程。
+
+核心流程可以总结为：
+
+1. 在 `types.go` 中定义自定义资源的 Go 类型，包括 `Spec`、`Status`、资源对象和资源列表对象。
+2. 在 `types.go` 和 `doc.go` 中添加 marker 注解，描述资源范围、字段校验、默认值、状态子资源、打印列和 client 生成规则。
+3. 在 `register.go` 中把自定义资源注册到 Kubernetes runtime scheme。
+4. 使用 `controller-gen` 生成 CRD YAML 和 DeepCopy 代码。
+5. 使用 `k8s.io/code-generator` 生成 Clientset、Informer、Lister。
+6. 将生成的 CRD 应用到集群后，就可以通过 `kubectl` 创建和查询 `Website` 资源。
+
+需要特别注意的是，`controller-gen` 和 `k8s.io/code-generator` 的职责不同：
+
+- `controller-gen` 负责根据 `kubebuilder` 注解生成 CRD 和 DeepCopy。
+- `k8s.io/code-generator` 负责根据 `+genclient` 等注解生成 Clientset、Informer、Lister。
+
+二者都依赖同一份 API 类型定义。只要 `types.go`、`doc.go`、`register.go` 组织正确，后续生成出来的 CRD、client、informer、lister 就能保持一致。
+
+本章完成的是自定义资源开发的第一步：定义 API。下一步可以基于生成的 Informer 或 Clientset 编写 Controller，监听 `Website` 资源变化，并根据 `spec` 创建真实的 Kubernetes 工作负载，同时更新 `status`。 
