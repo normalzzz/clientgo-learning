@@ -7,6 +7,7 @@
 参考资料：
 
 - Kubernetes 自定义资源文档：https://kubernetes.io/zh-cn/docs/concepts/extend-kubernetes/api-extension/custom-resources/
+- Kubernetes Sample Controller：https://github.com/kubernetes/sample-controller
 - controller-tools 项目仓库：https://github.com/kubernetes-sigs/controller-tools
 - Kubebuilder controller-gen 文档：https://book.kubebuilder.io/reference/controller-gen
 
