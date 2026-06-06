@@ -1,0 +1,42 @@
+# Go build artifacts
+bin/
+build/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace and dependency caches
+go.work
+go.work.sum
+vendor/
+
+# Test and coverage output
+coverage.out
+coverage.*
+*.cover
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+*.kubeconfig
+kubeconfig
+config
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
