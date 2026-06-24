@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM public.ecr.aws/docker/library/golang:1.25-alpine AS builder
 
 WORKDIR /src
 
@@ -12,5 +12,5 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /out/website-controller /website-controller
 
-USER nonroot:nonroot
+USER 65532:65532
 ENTRYPOINT ["/website-controller"]
