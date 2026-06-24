@@ -48,3 +48,7 @@ Thumbs.db
 
 !/config/
 !/config/**
+
+chapter5/cert/*
+chapter5/kb.md
+chapter5/cert/

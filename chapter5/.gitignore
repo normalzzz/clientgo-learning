@@ -1,0 +1,6 @@
+/.bin/
+/.gocache/
+/.gomodcache/
+
+!/config/
+!/config/**
