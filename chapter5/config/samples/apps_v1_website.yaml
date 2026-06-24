@@ -1,0 +1,9 @@
+apiVersion: apps.clientgo-learning.io/v1
+kind: Website
+metadata:
+  name: demo-website-v1
+  namespace: default
+spec:
+  image: public.ecr.aws/nginx/nginx:latest
+  replicas: 2
+  servicePort: 80

@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: clientgo-learning-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: website-conversion-webhook
+  namespace: clientgo-learning-system
+spec:
+  selector:
+    app: website-conversion-webhook
+  ports:
+  - name: https
+    port: 443
+    targetPort: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: website-conversion-webhook
+  namespace: clientgo-learning-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: website-conversion-webhook
+  template:
+    metadata:
+      labels:
+        app: website-conversion-webhook
+    spec:
+      containers:
+      - name: webhook
+        image: website-conversion-webhook:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --addr=:9443
+        - --cert-file=/tls/tls.crt
+        - --key-file=/tls/tls.key
+        ports:
+        - name: https
+          containerPort: 9443
+        readinessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /healthz
+            port: https
+        volumeMounts:
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+      volumes:
+      - name: tls
+        secret:
+          secretName: website-conversion-webhook-tls
