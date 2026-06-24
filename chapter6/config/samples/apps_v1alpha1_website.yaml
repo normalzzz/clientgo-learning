@@ -1,0 +1,9 @@
+apiVersion: apps.clientgo-learning.io/v1alpha1
+kind: Website
+metadata:
+  name: demo-website
+  namespace: default
+spec:
+  image: nginx:1.27
+  replicas: 2
+  port: 80

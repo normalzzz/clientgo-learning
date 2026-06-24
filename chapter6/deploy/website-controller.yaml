@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: website-controller
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: website-controller
+  namespace: website-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: website-controller
+rules:
+  - apiGroups: ["apps.clientgo-learning.io"]
+    resources: ["websites"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps.clientgo-learning.io"]
+    resources: ["websites/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: website-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: website-controller
+subjects:
+  - kind: ServiceAccount
+    name: website-controller
+    namespace: website-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: website-controller
+  namespace: website-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: website-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: website-controller
+    spec:
+      serviceAccountName: website-controller
+      containers:
+        - name: controller
+          image: your-registry/website-controller:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WATCH_NAMESPACE
+              value: ""
+            - name: SELF_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SELF_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
