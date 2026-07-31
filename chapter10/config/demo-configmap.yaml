@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workqueue-demo
+  namespace: default
+  labels:
+    workqueue.demo/enabled: "true"
+  annotations:
+    # Each controller fails attempts 1-4 and succeeds on attempt 5.
+    workqueue.demo/failures: "4"
+data:
+  request: compare-retry-schedules
