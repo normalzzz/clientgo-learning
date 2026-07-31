@@ -31,7 +31,7 @@ env/
 .env.*
 *.kubeconfig
 kubeconfig
-config
+
 
 # Editor and OS files
 .idea/
