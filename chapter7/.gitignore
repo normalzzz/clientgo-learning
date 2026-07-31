@@ -1,0 +1,7 @@
+/.bin/
+/.gocache/
+/.gomodcache/
+
+!/config/
+!/config/**
+deploy/website-controller-copy.yaml

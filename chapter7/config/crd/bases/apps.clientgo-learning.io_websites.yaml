@@ -1,0 +1,99 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: websites.apps.clientgo-learning.io
+spec:
+  group: apps.clientgo-learning.io
+  names:
+    kind: Website
+    listKind: WebsiteList
+    plural: websites
+    shortNames:
+    - web
+    singular: website
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.image
+      name: Image
+      type: string
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          Website is a small custom resource used to demonstrate controller-gen and
+          client-go code generation.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WebsiteSpec describes the desired state of a Website.
+            properties:
+              image:
+                description: Image is the container image used by the website workload.
+                minLength: 1
+                type: string
+              port:
+                default: 80
+                description: Port is the container port exposed by the website.
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
+              replicas:
+                default: 1
+                description: Replicas is the desired number of website pods.
+                format: int32
+                minimum: 0
+                type: integer
+            required:
+            - image
+            type: object
+          status:
+            description: WebsiteStatus describes the observed state of a Website.
+            properties:
+              phase:
+                description: Phase summarizes the current lifecycle state.
+                enum:
+                - Pending
+                - Available
+                - Degraded
+                type: string
+              readyReplicas:
+                description: ReadyReplicas is the number of pods currently ready to
+                  serve traffic.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
