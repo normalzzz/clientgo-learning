@@ -1,427 +1,348 @@
-# Website Controller
+# Chapter 7: 使用 Finalizer 管理资源删除流程
 
-chapter3 定义了 `Website` 自定义资源，并生成了 Clientset、Informer 和 Lister。chapter6 的重点是使用这些代码实现一个标准的 client-go Controller。
+本章在 Website Controller 中引入 Finalizer：创建 Website 后先添加清理标记；删除 Website 时，Controller 向 API Server 提交同名 Deployment 和 Service 的删除请求，成功后再移除标记，让 Website 完成删除。
 
-创建下面的 Website：
+本章内容根据 [kb.md](./kb.md) 整理，重点是理解 Finalizer 与 `deletionTimestamp` 的配合，以及如何在 client-go 调谐循环中实现可重试的清理逻辑。
+
+## 目录结构
+
+```text
+chapter7/
+  main.go                          # 初始化客户端，获得 Leader 身份后启动 Controller
+  handler.go                       # Website 和从属资源事件入队
+  controller.go                    # Finalizer、资源清理、正常调谐和状态更新
+  controller_test.go               # Finalizer 添加和资源调谐测试
+  pkg/
+    apis/apps/v1alpha1/             # Website API 定义
+    generated/                     # Clientset、Informer、Lister
+    leaderelection/                # 基于 Lease 的 Leader Election
+  config/
+    crd/bases/                     # Website CRD
+    samples/apps_v1alpha1_website.yaml
+  deploy/website-controller.yaml   # Controller 部署和 RBAC 模板
+  Dockerfile
+  Makefile
+  go.mod
+  go.sum
+  kb.md
+  README.md
+```
+
+## 1. 为什么需要 Finalizer
+
+Controller 有时需要在资源消失前完成额外操作，例如释放云负载均衡器、删除 DNS 记录，或提交关联资源的删除请求。如果只在对象已经删除后处理，一旦清理失败，Controller 就难以继续通过原对象记录和重试这项工作。
+
+Finalizer 是 `metadata.finalizers` 中的字符串键：
 
 ```yaml
-apiVersion: apps.clientgo-learning.io/v1alpha1
-kind: Website
 metadata:
-  name: demo-website
-  namespace: default
-spec:
-  image: nginx:1.27
-  replicas: 2
-  port: 80
+  finalizers:
+    - apps.clientgo-learning.io/website-finalizer
 ```
 
-Controller 会维护：
+它表示该对象仍有清理责任需要完成。Finalizer 本身不执行任何代码，具体操作由负责这个键的 Controller 实现。
 
-- 一个同名 Deployment，用于运行 Website Pod。
-- 一个同名 ClusterIP Service，用于暴露 Website 端口。
-- `Website.status.readyReplicas` 和 `Website.status.phase`。
+带有 Finalizer 的对象收到删除请求后，会保留在 API Server 中。Controller 完成自己负责的清理后移除对应的键；所有 Finalizer 都移除后，对象才能完成删除。
 
-## Controller 的代码结构
+### Finalizer 与 OwnerReference
 
-```text
-chapter6/
-├── main.go
-├── handler.go
-├── controller.go
-├── controller_test.go
-├── pkg/
-│   ├── apis/                         # Website API 定义
-│   └── generated/                    # Clientset、Informer、Lister
-├── config/
-│   ├── crd/
-│   └── samples/
-├── deploy/website-controller.yaml
-└── Dockerfile
-```
+本章创建的 Deployment 和 Service 仍然带有指向 Website 的 controller OwnerReference。
 
-各文件职责：
-
-- `main.go`：创建 Clientset 和 InformerFactory，启动 Informer 和 Controller。
-- `handler.go`：实现 create、update、delete 事件回调，把资源 key 放入 workqueue。
-- `controller.go`：从 workqueue 取 key，执行 Deployment、Service 和 Website status 的调谐。
-- `pkg/generated`：由代码生成器生成的 Website Clientset、Informer 和 Lister。
-
-Controller 的核心链路如下：
-
-```text
-API Server
-    │ List / Watch
-    ▼
-Informer ──事件回调──> Workqueue ──worker──> syncHandler
-    │                                           │
-    └──本地缓存 <────────────── Lister 读取───────┘
-                                                │
-                                                ├── 调谐 Deployment
-                                                ├── 调谐 Service
-                                                └── 更新 Website status
-```
-
-事件回调不直接创建 Deployment 或 Service。回调只负责将 `namespace/name` 放入队列，耗时操作由 worker 异步执行。这样可以避免阻塞 Informer 的事件分发，同时利用 rate-limited workqueue 实现失败重试。
-
-## 1. Informer 监听什么事件
-
-本项目创建了三个 Informer：
-
-```go
-websiteInformer := websiteInformerFactory.Apps().V1alpha1().Websites()
-deploymentInformer := kubeInformerFactory.Apps().V1().Deployments()
-serviceInformer := kubeInformerFactory.Core().V1().Services()
-```
-
-它们分别监听：
-
-| Informer | 监听资源 | 作用 |
+| 机制 | 作用 | 本章中的使用 |
 | --- | --- | --- |
-| Website Informer | `apps.clientgo-learning.io/v1alpha1` Website | Website 创建、规格修改或删除后触发调谐 |
-| Deployment Informer | `apps/v1` Deployment | Pod 就绪数变化或 Deployment 被修改、删除后重新调谐其所属 Website |
-| Service Informer | `core/v1` Service | Service 被修改或删除后重新调谐其所属 Website |
+| OwnerReference | 描述资源归属，供 Kubernetes 垃圾回收器处理从属资源 | Deployment 和 Service 指向 Website |
+| Finalizer | 在对象完成删除前保留清理机会 | Website 删除期间主动提交 Deployment 和 Service 的删除请求 |
 
-`WATCH_NAMESPACE` 用于限定监听范围。环境变量为空时监听所有 namespace，否则只监听指定 namespace：
+普通 Kubernetes 从属资源通常可以交给垃圾回收器清理。本章通过显式删除 Deployment 和 Service 演示 Finalizer 的执行位置；外部资源清理也可以放在这一分支中。
 
-```go
-namespace := os.Getenv("WATCH_NAMESPACE")
-if namespace == "" {
-    namespace = metav1.NamespaceAll
-}
-
-kubeInformerFactory := informers.NewSharedInformerFactoryWithOptions(
-    kubeClient,
-    30*time.Second,
-    informers.WithNamespace(namespace),
-)
-websiteInformerFactory := externalversions.NewSharedInformerFactoryWithOptions(
-    websiteClient,
-    30*time.Second,
-    externalversions.WithNamespace(namespace),
-)
-```
-
-### Website Informer 如何监听 API Server
-
-chapter3 生成的 Website Informer 位于：
+## 2. Kubernetes 删除流程
 
 ```text
-pkg/generated/informers/externalversions/apps/v1alpha1/website.go
+Website 正常存在，带有 Finalizer
+    |
+    | 用户提交 DELETE
+    v
+API Server 设置 metadata.deletionTimestamp，保留对象
+    |
+    | Informer 收到 Update 事件，Website key 入队
+    v
+syncHandler 进入删除分支
+    |
+    | 删除 Deployment，再删除 Service
+    | 失败：保留 Finalizer，workqueue 退避重试
+    v
+两个删除请求成功，或资源已不存在
+    |
+    | Controller 移除自己的 Finalizer
+    v
+所有 Finalizer 清除后，API Server 完成 Website 删除
+    |
+    v
+Informer 收到 Delete 事件，Lister 查询返回 NotFound
 ```
 
-其核心是使用生成的 Website Client 创建 `ListWatch`：
+这里需要区分两个时间点：
+
+- **收到删除请求**：API Server 设置 `deletionTimestamp`，通常返回 HTTP `202 Accepted`。对象仍存在，Informer 首先收到 Update 事件。
+- **对象完成删除**：所有 Finalizer 清除、对象消失后，Informer 才收到 Delete 事件。
+
+因此，清理逻辑放在 `syncHandler` 中，通过 `deletionTimestamp` 判断是否进入删除流程。仅在 `OnDelete` 中清理已经太晚。
+
+对象进入删除流程后，不能再添加新的 Finalizer，所以需要在正常调谐阶段提前添加。
+
+## 3. Controller 中的实现
+
+核心代码位于 [controller.go](./controller.go)。
+
+### Finalizer 名称和辅助函数
+
+本章使用的键为：
 
 ```go
-return cache.NewSharedIndexInformer(
-    cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
-        ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
-            return client.AppsV1alpha1().Websites(namespace).List(ctx, options)
-        },
-        WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
-            return client.AppsV1alpha1().Websites(namespace).Watch(ctx, options)
-        },
-    }, client),
-    &appsv1alpha1.Website{},
-    resyncPeriod,
-    indexers,
-)
+const websiteFinalizer = "apps.clientgo-learning.io/website-finalizer"
 ```
 
-Informer 首先通过 `List` 获取已有对象，建立本地缓存；随后通过 `Watch` 持续接收资源变化。对 Controller 来说，这些变化最终表现为三类回调：
-
-- `AddFunc`：对象被创建，或者 Informer 初次 List 时发现已有对象。
-- `UpdateFunc`：对象发生修改；定时 resync 也可能产生新旧对象内容相同的 update 回调。
-- `DeleteFunc`：对象被删除。
-
-### 注册 Website 的 create、update、delete 回调
-
-`controller.go` 中通过 `AddEventHandler` 注册三个回调：
+域名前缀用于区分不同 Controller 的清理责任。代码复用了 controller-runtime 的三个辅助函数：
 
 ```go
-websiteHandler := NewWebsiteHandler(c.queue)
-if _, err := websiteInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-    AddFunc:    websiteHandler.OnAdd,
-    UpdateFunc: websiteHandler.OnUpdate,
-    DeleteFunc: websiteHandler.OnDelete,
-}); err != nil {
-    return err
-}
+controllerutil.ContainsFinalizer(obj, finalizer)
+controllerutil.AddFinalizer(obj, finalizer)
+controllerutil.RemoveFinalizer(obj, finalizer)
 ```
 
-这里的对应关系是：
+它们来自 `sigs.k8s.io/controller-runtime/pkg/controller/controllerutil`。本章的事件接收、缓存和 workqueue 仍由 client-go 实现；这些辅助函数只操作内存中的对象，修改后还需要调用 Kubernetes API 持久化。
 
-| Kubernetes 资源事件 | ResourceEventHandlerFuncs | 本项目方法 |
-| --- | --- | --- |
-| Create | `AddFunc` | `WebsiteHandler.OnAdd` |
-| Update | `UpdateFunc` | `WebsiteHandler.OnUpdate` |
-| Delete | `DeleteFunc` | `WebsiteHandler.OnDelete` |
-
-### 注册 Deployment 和 Service 的事件回调
-
-Controller 创建的 Deployment 和 Service 也是调谐输入。例如 Deployment 的 `readyReplicas` 改变后，需要重新计算 Website status；Service 被删除后，需要重新创建。
-
-两个从属资源共用 `OwnedResourceHandler`：
+### 正常调谐前添加 Finalizer
 
 ```go
-ownedHandler := NewOwnedResourceHandler(c.queue)
-childHandlers := cache.ResourceEventHandlerFuncs{
-    AddFunc:    ownedHandler.OnAdd,
-    UpdateFunc: ownedHandler.OnUpdate,
-    DeleteFunc: ownedHandler.OnDelete,
-}
+if website.GetDeletionTimestamp() == nil &&
+    !controllerutil.ContainsFinalizer(website, websiteFinalizer) {
+    updated := website.DeepCopy()
+    controllerutil.AddFinalizer(updated, websiteFinalizer)
 
-if _, err := deploymentInformer.AddEventHandler(childHandlers); err != nil {
-    return err
-}
-_, err := serviceInformer.AddEventHandler(childHandlers)
-return err
-```
-
-从属资源回调不会把 Deployment 或 Service 自己的 key 放入队列，而是读取其 `OwnerReference`，把所属 Website 的 key 放入队列。
-
-### 启动 Informer
-
-完成事件注册后，`main.go` 启动两个 InformerFactory：
-
-```go
-kubeInformerFactory.Start(ctx.Done())
-websiteInformerFactory.Start(ctx.Done())
-
-if err := controller.Run(ctx, 2); err != nil {
-    log.Fatalf("controller stopped with error: %v", err)
-}
-```
-
-Controller 在启动 worker 前等待三个 Informer 的缓存完成首次同步：
-
-```go
-if ok := cache.WaitForCacheSync(
-    ctx.Done(),
-    c.websiteSynced,
-    c.deploymentSynced,
-    c.serviceSynced,
-); !ok {
-    return fmt.Errorf("failed to wait for caches to sync")
-}
-```
-
-等待缓存同步可以避免 worker 已经开始处理，但 Lister 的本地缓存中还没有初始对象。
-
-## 2. Create、Update、Delete 回调函数的实现
-
-事件回调定义在 `handler.go` 中，分为 `WebsiteHandler` 和 `OwnedResourceHandler`。
-
-### Website 事件回调
-
-#### Create：OnAdd
-
-```go
-func (h *WebsiteHandler) OnAdd(obj interface{}) {
-    h.enqueue(obj)
-}
-```
-
-创建 Website 时，Informer 将新对象传给 `OnAdd`。回调不执行具体业务逻辑，只调用 `enqueue` 生成 key 并放入 workqueue。
-
-Informer 首次 List 已存在的 Website 时，也会调用 `OnAdd`。因此 Controller 重启后，即使 Website 没有发生新的修改，也会重新调谐所有已有 Website。
-
-#### Update：OnUpdate
-
-```go
-func (h *WebsiteHandler) OnUpdate(oldObj, newObj interface{}) {
-    oldWebsite, oldOK := oldObj.(*appsv1alpha1.Website)
-    newWebsite, newOK := newObj.(*appsv1alpha1.Website)
-    if !oldOK || !newOK {
-        log.Printf("received update objects that are not Websites")
-        return
+    if _, err := c.websiteClient.AppsV1alpha1().
+        Websites(namespace).
+        Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+        return fmt.Errorf("add finalizer to Website %s/%s: %w", namespace, name, err)
     }
-    if oldWebsite.ResourceVersion == newWebsite.ResourceVersion {
-        return
-    }
-    h.enqueue(newWebsite)
-}
-```
-
-`OnUpdate` 会收到修改前后的两个对象：
-
-1. 先进行类型断言，确保对象是 Website。
-2. 比较 `ResourceVersion`。如果版本未变化，说明可能只是 Informer resync，不需要重复调谐。
-3. 将新对象加入队列。
-
-当 `spec.image`、`spec.replicas` 或 `spec.port` 改变时，Website 的 `ResourceVersion` 会变化，worker 随后把新规格同步到 Deployment 和 Service。
-
-Website status 更新同样会触发 update 事件，因此 key 可能再次入队。下一次调谐发现期望状态和实际状态一致后不会重复写入，从而结束本轮调谐。
-
-#### Delete：OnDelete
-
-```go
-func (h *WebsiteHandler) OnDelete(obj interface{}) {
-    h.enqueue(obj)
-}
-```
-
-删除事件仍然将 Website key 放入队列。worker 通过 Lister 查询时会得到 `NotFound`，然后结束处理：
-
-```go
-website, err := c.websiteLister.Websites(namespace).Get(name)
-if apierrors.IsNotFound(err) {
     return nil
 }
 ```
 
-Deployment 和 Service 设置了指向 Website 的 controller OwnerReference，所以 Website 删除后由 Kubernetes Garbage Collector 清理从属资源，Controller 不需要手动删除。
+这段逻辑有三个要点：
 
-#### enqueue：将对象转换为队列 key
+1. 只对尚未进入删除流程的 Website 添加 Finalizer。
+2. 通过 `DeepCopy()` 修改副本，避免直接修改 Lister 返回的 Informer 缓存对象。
+3. 更新成功后立即返回，等待 Informer 推送新版本并再次入队，再创建 Deployment、Service 和更新 status。
 
-三个回调最终都使用同一个 `enqueue`：
+提前返回可以避免后续步骤继续使用添加 Finalizer 前的旧 `resourceVersion` 更新 Website。
+
+### 删除期间清理资源
 
 ```go
-func (h *WebsiteHandler) enqueue(obj interface{}) {
-    key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-    if err != nil {
-        log.Printf("failed to build Website key: %v", err)
-        return
+if website.GetDeletionTimestamp() != nil {
+    if controllerutil.ContainsFinalizer(website, websiteFinalizer) {
+        if err := c.kubeClient.AppsV1().Deployments(namespace).
+            Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+            return err
+        }
+        if err := c.kubeClient.CoreV1().Services(namespace).
+            Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+            return err
+        }
+
+        updated := website.DeepCopy()
+        controllerutil.RemoveFinalizer(updated, websiteFinalizer)
+        _, err := c.websiteClient.AppsV1alpha1().
+            Websites(namespace).
+            Update(ctx, updated, metav1.UpdateOptions{})
+        return err
     }
-    h.queue.Add(key)
+    return nil
 }
 ```
 
-`DeletionHandlingMetaNamespaceKeyFunc` 将对象转换成 `namespace/name`，例如：
+清理按 Deployment、Service 的顺序提交删除请求。资源已不存在时，将 `NotFound` 视为成功，因此清理可以重复执行。
+
+任一步骤失败都会返回错误，保留 Finalizer。只有两次删除调用成功或资源已不存在时，才移除当前 Controller 负责的键，其他 Finalizer 会保留。
+
+当前实现以删除请求成功提交为完成条件，**不会等待 Deployment、Service 或其 Pod 彻底消失**。如果清理的是异步释放的外部资源，需要继续检查释放状态，确认完成后再移除 Finalizer。
+
+删除分支直接返回，因此处于删除流程中的 Website 不会继续创建从属资源或更新正常业务状态。当前清理代码按 namespace 和名称删除资源，没有在删除前检查 OwnerReference；实验时应使用本章 Controller 管理的同名资源。
+
+### 错误重试
+
+`processNextWorkItem` 负责处理调谐错误：
+
+```go
+if err := c.syncHandler(ctx, key); err != nil {
+    runtime.HandleError(fmt.Errorf("failed to sync %q: %w", key, err))
+    c.queue.AddRateLimited(key)
+    return true
+}
+
+c.queue.Forget(key)
+```
+
+例如，Deployment 已删除，但删除 Service 失败，下一次调谐会把 Deployment 的 `NotFound` 当作成功，再次尝试删除 Service。移除 Finalizer 时遇到更新冲突，也会通过同一条路径重试。
+
+### Informer 如何触发清理
+
+[handler.go](./handler.go) 中的 `WebsiteHandler.OnUpdate` 比较新旧对象的 `ResourceVersion`，版本变化时将 Website key 入队。添加 Finalizer、设置 `deletionTimestamp` 和移除 Finalizer 都会改变对象版本。
+
+Website 真正删除后，`OnDelete` 仍会入队；此时 `syncHandler` 从 Lister 读取到 `NotFound`，直接返回成功。
+
+## 4. 本地运行和验证
+
+准备 Go 1.26.0 或更高版本、可访问的测试集群，以及配置好的 `~/.kube/config`。以下命令从仓库根目录进入 `chapter7` 后执行。
+
+### 安装 CRD
+
+```bash
+cd chapter7
+go mod download
+kubectl apply -f config/crd/bases/apps.clientgo-learning.io_websites.yaml
+kubectl wait --for=condition=Established crd/websites.apps.clientgo-learning.io --timeout=60s
+```
+
+### 启动 Controller
+
+```bash
+WATCH_NAMESPACE=default SELF_POD_NAMESPACE=default go run .
+```
+
+`go run .` 会编译当前包的全部非测试文件。程序优先读取默认 kubeconfig，失败后尝试集群内配置。
+
+本章保留了 Leader Election：只有获得 `website-controller-leader` Lease 的实例才启动 Informer 和 worker。看到以下日志后再继续：
 
 ```text
-default/demo-website
+became leader, starting Website controller
+starting Website controller
 ```
 
-它同时支持普通对象和删除事件中的 `DeletedFinalStateUnknown` tombstone，因此 Website 删除回调可以安全地复用该方法。
+`WATCH_NAMESPACE` 指定监听范围，空值表示所有 namespace；`SELF_POD_NAMESPACE` 指定 Lease 所在 namespace，默认是 `default`。
 
-队列中只保存 key，而不是保存完整对象。worker 真正处理时会通过 Lister 获取缓存中的最新版本，从而合并短时间内对同一对象的多次修改。
+### 创建 Website 并检查 Finalizer
 
-### Deployment 和 Service 事件回调
+在另一个终端的 `chapter7` 目录执行：
 
-#### Create：OnAdd
-
-```go
-func (h *OwnedResourceHandler) OnAdd(obj interface{}) {
-    h.enqueueOwner(obj)
-}
+```bash
+kubectl apply -f config/samples/apps_v1alpha1_website.yaml
+kubectl get website demo-website -n default -o yaml
+kubectl get deployment,service -n default demo-website
+kubectl get website demo-website -n default -o jsonpath='{.metadata.finalizers}{"\n"}'
 ```
 
-Deployment 或 Service 被创建后，回调找到其 OwnerReference 对应的 Website 并重新入队。这样 Controller 可以在从属资源创建后继续检查状态。
+等待 Controller 调谐后，Finalizer 输出应包含：
 
-#### Update：OnUpdate
-
-```go
-func (h *OwnedResourceHandler) OnUpdate(oldObj, newObj interface{}) {
-    oldMeta, oldErr := meta.Accessor(oldObj)
-    newMeta, newErr := meta.Accessor(newObj)
-    if oldErr != nil || newErr != nil {
-        log.Printf("received child update objects without metadata")
-        return
-    }
-    if oldMeta.GetResourceVersion() == newMeta.GetResourceVersion() {
-        return
-    }
-    h.enqueueOwner(newObj)
-}
+```text
+["apps.clientgo-learning.io/website-finalizer"]
 ```
 
-该方法不依赖具体资源类型，而是通过 `meta.Accessor` 读取 Kubernetes 通用元数据，因此 Deployment 和 Service 可以共用一个 handler。
+确认 Finalizer 已添加，再进行删除实验。
 
-Deployment 状态发生变化时，例如 `readyReplicas` 增加，其 `ResourceVersion` 会变化，所属 Website 被重新调谐并更新 status。用户手动修改 Deployment 或 Service 时，同样会触发调谐，Controller 会把它们恢复到 Website spec 描述的期望状态。
+### 观察删除中的对象
 
-#### Delete：OnDelete
+为了观察对象保留期间的状态，先用 `Ctrl+C` 停止本地 Controller，并确保没有其他 Controller 实例接手处理这个 Website。
 
-```go
-func (h *OwnedResourceHandler) OnDelete(obj interface{}) {
-    if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-        obj = tombstone.Obj
-    }
-    h.enqueueOwner(obj)
-}
+提交删除请求，但不等待对象消失：
+
+```bash
+kubectl delete website demo-website -n default --wait=false
+kubectl get website demo-website -n default -o jsonpath='{.metadata.deletionTimestamp}{"\n"}{.metadata.finalizers}{"\n"}'
 ```
 
-Informer 收到删除通知时，对象可能已经不在本地缓存中。此时传入的不是原对象，而是 `DeletedFinalStateUnknown` tombstone。代码先从 tombstone 中取出最后一次观察到的对象，再读取 OwnerReference。
+此时应能看到非空的 `deletionTimestamp` 和仍然存在的 Finalizer。对象处于删除流程中，等待 Controller 清理。
 
-只要 Website 仍然存在，删除其 Deployment 或 Service 就会触发重新调谐，缺失的资源会被重新创建。
+重新启动 Controller：
 
-#### enqueueOwner：从从属资源定位 Website
-
-```go
-func (h *OwnedResourceHandler) enqueueOwner(obj interface{}) {
-    object, err := meta.Accessor(obj)
-    if err != nil {
-        log.Printf("failed to read child object metadata: %v", err)
-        return
-    }
-
-    owner := metav1.GetControllerOf(object)
-    if owner == nil ||
-        owner.APIVersion != appsv1alpha1.SchemeGroupVersion.String() ||
-        owner.Kind != "Website" {
-        return
-    }
-
-    key, err := cache.MetaNamespaceKeyFunc(&metav1.PartialObjectMetadata{
-        ObjectMeta: metav1.ObjectMeta{
-            Namespace: object.GetNamespace(),
-            Name:      owner.Name,
-        },
-    })
-    if err != nil {
-        log.Printf("failed to build owner Website key: %v", err)
-        return
-    }
-    h.queue.Add(key)
-}
+```bash
+WATCH_NAMESPACE=default SELF_POD_NAMESPACE=default go run .
 ```
 
-处理步骤：
+Controller 获得 Leader 身份后，初始同步会发现这个正在删除的 Website，继续执行清理。在另一个终端检查：
 
-1. 使用 `meta.Accessor` 读取对象元数据。
-2. 使用 `metav1.GetControllerOf` 获取 `controller=true` 的 OwnerReference。
-3. 检查 owner 的 API Version 和 Kind，避免处理不属于 Website 的资源。
-4. 使用从属资源的 namespace 和 owner name 构造 Website key。
-5. 将 Website key 放入同一个 workqueue。
+```bash
+kubectl wait --for=delete website/demo-website -n default --timeout=60s
+kubectl wait --for=delete deployment/demo-website -n default --timeout=60s
+kubectl wait --for=delete service/demo-website -n default --timeout=60s
+```
 
-因此，无论事件源是 Website、Deployment 还是 Service，队列中的 key 始终表示一个 Website。`syncHandler` 只需要处理一种 key 格式和一种顶层资源。
+### 查看 HTTP 删除响应
 
-## 事件与调谐行为总结
+可以另做一次实验观察 API Server 返回的 `202 Accepted`。先在 Controller 运行时重新创建 Website，确认 Finalizer 已添加，再停止所有处理它的 Controller 实例。
 
-| 事件 | 入队对象 | 调谐结果 |
-| --- | --- | --- |
-| Website create | Website | 创建 Deployment 和 Service，初始化 status |
-| Website update | Website | 同步镜像、副本数和端口，更新 status |
-| Website delete | Website | Lister 返回 NotFound；从属资源由 GC 清理 |
-| Deployment create/update | 所属 Website | 根据 ready replicas 更新 Website status，并修正配置漂移 |
-| Deployment delete | 所属 Website | 重新创建 Deployment |
-| Service create/update | 所属 Website | 检查并修正 Service 配置 |
-| Service delete | 所属 Website | 重新创建 Service |
+启动本地 API 代理：
 
-## 运行和测试
+```bash
+kubectl proxy --port=8001
+```
 
-运行测试：
+在另一个终端提交删除请求。本章 API 版本为 `v1alpha1`：
+
+```bash
+curl -i -X DELETE \
+  'http://127.0.0.1:8001/apis/apps.clientgo-learning.io/v1alpha1/namespaces/default/websites/demo-website' \
+  -H 'Content-Type: application/json' \
+  --data '{"apiVersion":"v1","kind":"DeleteOptions"}'
+```
+
+代理通过 kubeconfig 访问 API Server。带有 Finalizer 的 Website 会保留在删除流程中；实验后重新启动 Controller 完成清理，并用 `Ctrl+C` 结束代理。
+
+## 5. 权限与排障
+
+### 部署到集群时的权限
+
+当前 [部署模板](./deploy/website-controller.yaml) 需要替换镜像地址，并补充 Finalizer 流程所需权限：
+
+| API Group | 资源 | 需要补充的 verb | 用途 |
+| --- | --- | --- | --- |
+| `apps.clientgo-learning.io` | `websites` | `update` | 持久化 Finalizer 的添加和移除 |
+| `apps` | `deployments` | `delete` | 提交 Deployment 删除请求 |
+| `""` | `services` | `delete` | 提交 Service 删除请求 |
+
+这里通过 Website 主资源的 `Update` 修改 metadata，仅有 `websites/status` 的更新权限不足以保存 Finalizer。Leader Election 还依赖 Lease 权限，模板中已有对应规则。
+
+完成上述调整后，可执行：
+
+```bash
+kubectl apply -f deploy/website-controller.yaml
+kubectl logs -n website-controller deployment/website-controller -f
+```
+
+### Website 一直处于删除状态
+
+先查看资源元数据和 Controller 日志：
+
+```bash
+kubectl get website demo-website -n default -o yaml
+kubectl get lease website-controller-leader -n default -o yaml
+```
+
+Lease 的 namespace 应与实际 `SELF_POD_NAMESPACE` 一致；使用部署模板时为 `website-controller`。
+
+| 现象 | 检查方向 |
+| --- | --- |
+| 有 deletionTimestamp，但 Finalizer 一直保留 | 是否有活跃 Leader，监听范围是否包含 Website 所在 namespace |
+| 日志出现 Forbidden | Website 的 update、Deployment 和 Service 的 delete 权限是否齐全 |
+| 清理请求反复失败 | 根据日志中的 API 错误检查权限、连接或资源状态，修复后 Controller 会重试 |
+| 本章 Finalizer 已移除，对象仍未删除 | 是否还有其他 Controller 负责的 Finalizer |
+| Website 已消失，子资源仍在终止 | 本章只等待删除请求成功，子资源自己的 Finalizer 和终止流程仍可能继续 |
+
+应先修复清理失败的原因，再让 Controller 完成删除。手动清空 Finalizer 会跳过对应的清理责任，可能留下关联资源。
+
+## 6. 测试
+
+在 `chapter7` 目录运行现有单元测试：
 
 ```bash
 go test ./...
 ```
 
-安装 CRD：
+[controller_test.go](./controller_test.go) 当前覆盖：
 
-```bash
-kubectl apply -f config/crd/bases/apps.clientgo-learning.io_websites.yaml
-```
+- 在创建从属资源之前添加 Finalizer，且不修改 Informer 缓存对象。
+- 已有 Finalizer 时创建 Deployment、Service 并更新 Website status。
+- 副本数和端口的默认值。
 
-部署 Controller 前，需要把 `deploy/website-controller.yaml` 中的镜像替换成实际镜像，然后执行：
-
-```bash
-kubectl apply -f deploy/website-controller.yaml
-kubectl apply -f config/samples/apps_v1alpha1_website.yaml
-```
-
-查看资源和状态：
-
-```bash
-kubectl get websites,deployments,services -n default
-kubectl get website demo-website -n default -o yaml
-```
+这些测试使用 fake client；删除分支的失败重试尚无专项单元测试，真实 API Server 的 Finalizer 保留和删除行为可按上面的集群实验验证。

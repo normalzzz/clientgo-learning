@@ -1,4 +1,4 @@
-# Website Controller
+# Chapter 6: Website Controller
 
 chapter3 定义了 `Website` 自定义资源，并生成了 Clientset、Informer 和 Lister。chapter6 的重点是使用这些代码实现一个标准的 client-go Controller。
 

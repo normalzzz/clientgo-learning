@@ -1,4 +1,4 @@
-# KB：使用 OwnerReference 管理 Kubernetes 资源生命周期
+# Chapter 9：使用 OwnerReference 管理 Kubernetes 资源生命周期
 
 本文以 chapter9 中的 Deployment 和 ConfigMap 为例，说明 Kubernetes 如何通过
 `metadata.ownerReferences` 表达资源的所有权关系，以及 Garbage Collector（GC）
